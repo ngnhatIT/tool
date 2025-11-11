@@ -1,0 +1,10 @@
+{
+    "gemini_api_key": "YOUR_API_KEY_HERE",
+    "gemini_model": "gemini-1.5-flash",
+    "last_connection": {
+        "host": "localhost",
+        "port": "3306",
+        "database": "",
+        "user": "root"
+    }
+}
