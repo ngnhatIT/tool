@@ -50,6 +50,17 @@ logger = logging.getLogger('SQLReviewerPro')
 MSG_WARNING = 'Cảnh báo'
 MSG_SUCCESS = 'Thành công'
 MSG_ERROR = 'Lỗi'
+
+# Font constants
+FONT_SEGOE_UI = 'Segoe UI'
+FONT_COURIER_NEW = 'Courier New'
+
+# Button text constants
+BTN_TEXT_SEND = '📤 Gửi'
+
+# Message constants
+MSG_MISSING_DATA = '⚠️ Thiếu dữ liệu'
+
 def safe_execute(func):
     """Decorator xử lý exception an toàn + logging cho mọi method UI gọi từ signal.
     - Bắt mọi exception, ghi vào app.log
@@ -276,7 +287,6 @@ class LoadingOverlay(QWidget):
                 padding: 25px 45px;
                 border-radius: 12px;
                 border: 3px solid {COLORS['primary']};
-                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
             }}
         """)
         self.loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -306,12 +316,6 @@ class LoadingOverlay(QWidget):
             alpha = int(255 * (i + 1) / 8)
             color = QColor(37, 99, 235, alpha)  # Primary color with varying alpha
             painter.setBrush(color)
-            
-            angle_deg = (self.angle + i * 45) % 360
-            angle_rad = angle_deg * 3.14159 / 180
-            
-            x = center_x + int(radius * 0.8 * (i / 8) * abs(1 - (i / 4)))
-            y = center_y
             
             # Draw circle
             painter.drawEllipse(
@@ -388,7 +392,7 @@ class AIChatDialog(QDialog):
         # Chat history display
         self.chat_display = QTextEdit()
         self.chat_display.setReadOnly(True)
-        self.chat_display.setFont(QFont('Segoe UI', 10))
+        self.chat_display.setFont(QFont(FONT_SEGOE_UI, 10))
         self.chat_display.setStyleSheet(f"""
             QTextEdit {{
                 background-color: #f9fafb;
@@ -439,7 +443,7 @@ class AIChatDialog(QDialog):
         self.user_input = QTextEdit()
         self.user_input.setPlaceholderText('Nhập câu hỏi của bạn... (Shift+Enter để xuống dòng)')
         self.user_input.setMaximumHeight(80)
-        self.user_input.setFont(QFont('Segoe UI', 10))
+        self.user_input.setFont(QFont(FONT_SEGOE_UI, 10))
         self.user_input.setStyleSheet(f"""
             QTextEdit {{
                 border: 2px solid {COLORS['border']};
@@ -450,7 +454,7 @@ class AIChatDialog(QDialog):
         input_layout.addWidget(self.user_input)
         
         # Send button
-        send_btn = QPushButton('📤 Gửi')
+        send_btn = QPushButton(BTN_TEXT_SEND)
         send_btn.clicked.connect(self.send_message)
         send_btn.setStyleSheet(f"""
             QPushButton {{
@@ -540,7 +544,7 @@ class AIChatDialog(QDialog):
             formatted = f"""
 <div style='background: linear-gradient(135deg, {COLORS["primary"]} 0%, {COLORS["secondary"]} 100%); 
             color: white; padding: 12px 16px; border-radius: 18px 18px 4px 18px; 
-            margin: 8px 0 8px 60px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin: 8px 0 8px 60px;
             max-width: 80%;'>
     <b>👤 Bạn:</b><br>{message.replace(chr(10), '<br>')}
 </div>
@@ -550,7 +554,7 @@ class AIChatDialog(QDialog):
 <div style='background-color: white; color: {COLORS["text_primary"]}; 
             padding: 12px 16px; border-radius: 18px 18px 18px 4px; 
             margin: 8px 60px 8px 0; border: 2px solid {COLORS["border"]};
-            box-shadow: 0 2px 4px rgba(0,0,0,0.08); max-width: 80%;'>
+            max-width: 80%;'>
     <b style="color: {COLORS["primary"]};">🤖 Gemini AI:</b><br>{message.replace(chr(10), '<br>')}
 </div>
 """
@@ -599,7 +603,7 @@ class AIChatDialog(QDialog):
         self.chat_history.append({'role': 'model', 'parts': [ai_message]})
         
         self.send_btn.setEnabled(True)
-        self.send_btn.setText('📤 Gửi')
+        self.send_btn.setText(BTN_TEXT_SEND)
         self.chat_worker = None
 
     def on_chat_error(self, error_message: str):
@@ -610,7 +614,7 @@ class AIChatDialog(QDialog):
         self.add_message('assistant', error_msg_display)
         
         self.send_btn.setEnabled(True)
-        self.send_btn.setText('📤 Gửi')
+        self.send_btn.setText(BTN_TEXT_SEND)
         self.chat_worker = None
 
     def call_gemini(self, message: str):
@@ -635,7 +639,7 @@ class AIChatDialog(QDialog):
         finally:
             # Re-enable send button
             self.send_btn.setEnabled(True)
-            self.send_btn.setText('📤 Gửi')
+            self.send_btn.setText(BTN_TEXT_SEND)
     
     def clear_history(self):
         """Xóa lịch sử chat"""
@@ -931,7 +935,7 @@ class SQLReviewerApp(QMainWindow):
             'ORDER BY o.order_date DESC;'
         )
         self.sql_input.setMinimumHeight(200)
-        self.sql_input.setFont(QFont('Courier New', 10))
+        self.sql_input.setFont(QFont(FONT_COURIER_NEW, 10))
         self.sql_input.setStyleSheet(f"""
             QTextEdit {{
                 background-color: white;
@@ -1021,13 +1025,13 @@ class SQLReviewerApp(QMainWindow):
         # Tab 1: Review Result
         self.result_output = QTextEdit()
         self.result_output.setReadOnly(True)
-        self.result_output.setFont(QFont('Segoe UI', 10))
+        self.result_output.setFont(QFont(FONT_SEGOE_UI, 10))
         self.result_tabs.addTab(self.result_output, qta.icon('fa5s.poll'), 'Kết quả Review')
         
         # Tab 2: Raw SQL
         self.raw_sql_output = QTextEdit()
         self.raw_sql_output.setReadOnly(True)
-        self.raw_sql_output.setFont(QFont('Courier New', 9))
+        self.raw_sql_output.setFont(QFont(FONT_COURIER_NEW, 9))
         self.result_tabs.addTab(self.raw_sql_output, qta.icon('fa5s.code'), 'SQL Query')
         
         # Tab 3: SQL Bind Params (NEW)
@@ -1044,7 +1048,7 @@ class SQLReviewerApp(QMainWindow):
             '  AND status = ?\n' +
             '  AND created_date > ?'
         )
-        self.bind_sql_input.setFont(QFont('Courier New', 10))
+        self.bind_sql_input.setFont(QFont(FONT_COURIER_NEW, 10))
         self.bind_sql_input.setMinimumHeight(150)
         bind_layout.addWidget(self.bind_sql_input)
         
@@ -1073,7 +1077,7 @@ class SQLReviewerApp(QMainWindow):
             'Format 1 (JSON): ["COMP001", "active", 123]\n'
             'Format 2 (Param): param:[1-COMP001][2-active][3-123]'
         )
-        self.bind_params_input.setFont(QFont('Courier New', 10))
+        self.bind_params_input.setFont(QFont(FONT_COURIER_NEW, 10))
         self.bind_params_input.setMaximumHeight(80)
         bind_layout.addWidget(self.bind_params_input)
         
@@ -1107,7 +1111,7 @@ class SQLReviewerApp(QMainWindow):
         bind_layout.addWidget(QLabel('<b>Kết quả SQL đã Bind:</b>'))
         self.bind_result_output = QTextEdit()
         self.bind_result_output.setReadOnly(True)
-        self.bind_result_output.setFont(QFont('Courier New', 10))
+        self.bind_result_output.setFont(QFont(FONT_COURIER_NEW, 10))
         bind_layout.addWidget(self.bind_result_output)
         
         self.result_tabs.addTab(bind_widget, qta.icon('fa5s.plug'), 'Bind Parameters')
@@ -1268,7 +1272,6 @@ class SQLReviewerApp(QMainWindow):
                 font-weight: 600;
                 font-size: 13px;
                 min-height: 18px;
-                transition: background 0.2s;
             }}
             QPushButton:hover {{
                 background-color: {COLORS['secondary_hover']};
@@ -2128,14 +2131,14 @@ BẮT ĐẦU REVIEW:
             """Test API key"""
             api_key = api_key_input.text().strip()
             if not api_key:
-                QMessageBox.warning(dialog, '⚠️ Thiếu dữ liệu', 'Vui lòng nhập API Key!')
+                QMessageBox.warning(dialog, MSG_MISSING_DATA, 'Vui lòng nhập API Key!')
                 return
             
             try:
                 # Test với Gemini API
                 configure(api_key=api_key)
                 model = GenerativeModel('gemini-1.5-flash')
-                response = model.generate_content('Hello')
+                model.generate_content('Hello')
                 
                 QMessageBox.information(
                     dialog,
@@ -2157,7 +2160,7 @@ BẮT ĐẦU REVIEW:
             """Save API key to config"""
             api_key = api_key_input.text().strip()
             if not api_key:
-                QMessageBox.warning(dialog, '⚠️ Thiếu dữ liệu', 'Vui lòng nhập API Key!')
+                QMessageBox.warning(dialog, MSG_MISSING_DATA, 'Vui lòng nhập API Key!')
                 return
             
             try:
@@ -2369,11 +2372,11 @@ Params: param:[1-1][2-○][3-][4-JPN]
             params_text = self.bind_params_input.toPlainText().strip()
             
             if not sql:
-                QMessageBox.warning(self, '⚠️ Thiếu dữ liệu', 'Vui lòng nhập SQL query!')
+                QMessageBox.warning(self, MSG_MISSING_DATA, 'Vui lòng nhập SQL query!')
                 return
             
             if not params_text:
-                QMessageBox.warning(self, '⚠️ Thiếu dữ liệu', 'Vui lòng nhập parameters!')
+                QMessageBox.warning(self, MSG_MISSING_DATA, 'Vui lòng nhập parameters!')
                 return
             
             # Count placeholders
@@ -2473,7 +2476,7 @@ Params: param:[1-1][2-○][3-][4-JPN]
         
         # Find column comparisons with ?
         # Pattern: column_name = ?  or  table.column_name = ?
-        pattern = r'([a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)\s*[=<>!]+\s*\?'
+        pattern = r'(\w+\.)?(\w+)\s*[=<>!]+\s*\?'
         matches = re.findall(pattern, where_clause, re.IGNORECASE)
         
         for i, (table_prefix, column_name) in enumerate(matches):
@@ -2608,7 +2611,7 @@ def main():
             error_msg = f"❌ Unexpected Error:\n\n{exc_type.__name__}: {str(exc_value)}"
             try:
                 QMessageBox.critical(None, 'Application Error', error_msg)
-            except:
+            except Exception:
                 # Fallback if QMessageBox fails
                 print(error_msg)
         
@@ -2643,10 +2646,11 @@ def main():
                 # Create minimal app just for error display
                 error_app = QApplication(sys.argv)
                 QMessageBox.critical(None, 'Startup Error', error_msg)
-        except:
+        except Exception:
             print(error_msg)
         sys.exit(1)
 
 
 if __name__ == '__main__':
     main()
+
