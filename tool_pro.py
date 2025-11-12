@@ -1,9 +1,3 @@
-"""
-SQL Reviewer Tool - Công cụ Review SQL chuyên nghiệp với Gemini AI
-Version: 2.0
-Author: Advanced Version
-"""
-
 import sys
 import os
 import json
