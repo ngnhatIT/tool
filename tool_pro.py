@@ -947,6 +947,11 @@ class SQLReviewerApp(QMainWindow):
         self.current_review_result = ""
         self.randomizer = random.Random(42)
         
+        # Rate limit tracking
+        self.last_request_time = 0
+        self.request_count_minute = 0
+        self.request_times = []  # Track timestamps of last N requests
+        
         self.init_gemini_api()
         
         # Khởi tạo giao diện
@@ -2231,6 +2236,22 @@ class SQLReviewerApp(QMainWindow):
         prompt = self.build_enhanced_prompt(sql_query)
         estimated_tokens = len(prompt.split())  # Rough estimate: 1 token ≈ 1 word
         
+        # Check rate limit (15 requests/minute for free tier)
+        import time
+        current_time = time.time()
+        
+        # Remove requests older than 1 minute
+        self.request_times = [t for t in self.request_times if current_time - t < 60]
+        
+        if len(self.request_times) >= 14:  # Leave margin (14 instead of 15)
+            wait_time = int(60 - (current_time - self.request_times[0])) + 1
+            reply = QMessageBox.warning(self, 'Rate Limit',
+                f'⚠️ Đã gửi {len(self.request_times)} requests trong 1 phút\n\n' +
+                f'Free Tier giới hạn: 15 requests/phút\n\n' +
+                f'Vui lòng đợi {wait_time} giây trước khi thử lại.',
+                QMessageBox.StandardButton.Ok)
+            return
+        
         if estimated_tokens > 5000:  # Warning for large prompts
             reply = QMessageBox.warning(self, 'Prompt quá lớn',
                 f'⚠️ Prompt ước tính ~{estimated_tokens:,} tokens\n\n' +
@@ -2247,6 +2268,9 @@ class SQLReviewerApp(QMainWindow):
                 QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.No:
                 return
+        
+        # Track this request
+        self.request_times.append(current_time)
         
         # Show raw SQL in tab
         self.raw_sql_output.setText(sql_query)
@@ -2299,7 +2323,7 @@ class SQLReviewerApp(QMainWindow):
         self.status_bar.showMessage('❌ Review thất bại', 3000)
     
     def extract_table_names_from_sql(self, sql_query: str) -> set:
-        """Extract table names from SQL query"""
+        """Extract table names from SQL query (excluding aliases)"""
         import re
         
         # Remove comments and strings
@@ -2310,17 +2334,35 @@ class SQLReviewerApp(QMainWindow):
         
         tables = set()
         
-        # Pattern 1: FROM/JOIN table_name (with optional alias)
-        # Matches: FROM users, JOIN orders o, FROM `table_name`
-        pattern_from_join = r'\b(?:FROM|JOIN|INTO|UPDATE)\s+`?([a-zA-Z0-9_]+)`?(?:\s+(?:AS\s+)?[a-zA-Z0-9_]+)?'
+        # Pattern: FROM/JOIN table_name (PRIMARY source)
+        # This is the most reliable source
+        pattern_from_join = r'\b(?:FROM|JOIN|INTO|UPDATE)\s+`?([a-zA-Z0-9_]+)`?'
         matches = re.findall(pattern_from_join, sql_clean, re.IGNORECASE)
         tables.update(matches)
         
-        # Pattern 2: table.column format
-        # Matches: users.id, orders.user_id
+        # Pattern 2: table.column - for tables referenced but not in FROM/JOIN
+        # Example: SELECT other_table.column FROM main_table
         pattern_table_dot = r'\b([a-zA-Z0-9_]+)\.[a-zA-Z0-9_]+'
-        matches = re.findall(pattern_table_dot, sql_clean)
-        tables.update(matches)
+        dot_patterns = set(re.findall(pattern_table_dot, sql_clean))
+        
+        # Add dot patterns with smart filtering
+        for dot_table in dot_patterns:
+            # Skip very short names (likely aliases: u, o, t1, etc.)
+            if len(dot_table) <= 3:
+                continue
+            
+            # Check if this is an alias of an existing longer table
+            # Example: TIN801 is alias of TIN801_SCMLABELRSLT
+            is_alias = False
+            for existing_table in tables:
+                # If existing table starts with this dot_table + underscore, it's an alias
+                # Example: TIN801_SCMLABELRSLT starts with TIN801_
+                if existing_table.startswith(dot_table + '_'):
+                    is_alias = True
+                    break
+            
+            if not is_alias:
+                tables.add(dot_table)
         
         # Filter out SQL keywords
         sql_keywords = {
@@ -2328,7 +2370,8 @@ class SQLReviewerApp(QMainWindow):
             'INNER', 'OUTER', 'FULL', 'CROSS', 'ON', 'AND', 'OR', 'NOT', 'IN', 'EXISTS',
             'BETWEEN', 'LIKE', 'IS', 'NULL', 'AS', 'BY', 'GROUP', 'ORDER', 'HAVING',
             'LIMIT', 'OFFSET', 'UNION', 'ALL', 'DISTINCT', 'COUNT', 'SUM', 'AVG', 'MIN', 'MAX',
-            'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'WITH', 'RECURSIVE', 'VALUES', 'SET'
+            'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'WITH', 'RECURSIVE', 'VALUES', 'SET',
+            'CURRENT_DATE', 'CURRENT_TIME', 'CURRENT_TIMESTAMP'
         }
         
         # Remove keywords and invalid names
@@ -2367,12 +2410,15 @@ class SQLReviewerApp(QMainWindow):
             
             if filtered_tables:
                 schema_string += f"📊 **Các bảng liên quan** ({len(filtered_tables)}/{len(self.db_schema)} bảng):\n\n"
+                
                 for table, columns in filtered_tables.items():
                     schema_string += f"📋 **Bảng {table}**:\n"
                     for col in columns:
                         col_info = f"  - `{col['name']}` ({col['type']})"
                         if col['key'] == 'PRI':
                             col_info += " [PRIMARY KEY]"
+                        if col['key'] == 'MUL':
+                            col_info += " [FOREIGN KEY]"
                         if col['nullable'] == 'NO':
                             col_info += " [NOT NULL]"
                         if 'auto_increment' in col['extra'].lower():
@@ -2434,59 +2480,63 @@ class SQLReviewerApp(QMainWindow):
             relationship_string = "⚠️ Không có thông tin quan hệ khóa ngoại.\n"
         
         return f"""
-Bạn là một chuyên gia Senior Database Engineer và SQL Performance Tuning Expert với hơn 15 năm kinh nghiệm.
+Bạn là Senior Database Engineer với chuyên môn sâu về MySQL Performance Tuning và Query Optimization.
 
-📊 **CẤU TRÚC DATABASE**:
+📊 **CẤU TRÚC DATABASE** (chỉ các bảng liên quan):
 {schema_string}
 
-🔗 **QUAN HỆ BẢNG**:
+🔗 **QUAN HỆ FOREIGN KEY**:
 {relationship_string}
 
-🔍 **SQL QUERY CẦN REVIEW**:
+🎯 **SQL QUERY CẦN REVIEW**:
 ```sql
 {sql_query}
 ```
 
-📋 **NHIỆM VỤ REVIEW CHI TIẾT**:
-    
-Hãy phân tích toàn diện câu lệnh SQL theo các tiêu chí sau:
+---
 
-## 1. ✅ Phát hiện Lỗi (Errors & Issues)
-- Kiểm tra cú pháp SQL
-- Tên bảng, cột có tồn tại và đúng không?
-- Logic query có vấn đề gì không?
-- Các lỗi tiềm ẩn (data type mismatch, NULL handling...)
+**YÊU CẦU PHÂN TÍCH:**
 
-## 2. ⚡ Tối ưu Hiệu suất (Performance Optimization)
-- Đánh giá độ phức tạp query (O notation nếu có thể)
-- Đề xuất indexes cần thiết (với lý do cụ thể)
-- Tối ưu JOIN (type of JOIN, order, conditions)
-- Subquery vs JOIN - cái nào tốt hơn?
-- Sử dụng WHERE vs HAVING đúng chỗ chưa?
-- Có sử dụng SELECT * không cần thiết?
-- Đề xuất query hints nếu cần
+Hãy review query theo 6 tiêu chí sau, ngắn gọn nhưng đầy đủ:
 
-## 3. 🔒 Bảo mật (Security)
-- SQL Injection vulnerabilities
-- Quyền truy cập dữ liệu nhạy cảm
-- Đề xuất prepared statements/parameterized queries
+### 1. ✅ LỖI & VẤN ĐỀ (Errors & Issues)
+- Kiểm tra: Cú pháp, tên table/column có tồn tại, data type mismatch, NULL handling
+- Chỉ liệt kê nếu có lỗi thực sự
 
-## 4. 📖 Khả năng Đọc & Maintain (Readability)
-- Code formatting và style
-- Comment có đủ không?
-- Naming conventions
-- Đề xuất cách viết rõ ràng hơn
+### 2. ⚡ HIỆU SUẤT (Performance)
+- **Indexes cần thiết:** Chỉ đề xuất index quan trọng cho WHERE/JOIN/ORDER BY
+- **JOIN optimization:** Thứ tự JOIN, loại JOIN có hợp lý?
+- **Query complexity:** Ước lượng độ phức tạp (số rows scan)
+- **SELECT *:** Có nên chỉ định columns cụ thể?
+- **Subquery vs JOIN:** Cái nào tốt hơn?
 
-## 5. 💡 Best Practices
-- Tuân thủ SQL standards chưa?
-- Transaction handling (nếu có)
-- Error handling
-- Các best practices khác
+### 3. 🔒 BẢO MẬT (Security)
+- SQL Injection risk (nếu có user input)
+- Đề xuất dùng prepared statements/parameterized queries
 
-## 6. ✏️ Phiên bản Tối ưu (Optimized Version)
-Viết lại câu SQL đã được tối ưu (nếu cần), kèm giải thích các thay đổi.
+### 4. 📖 CODE QUALITY
+- Formatting: Dễ đọc không?
+- Naming: Table/column names rõ ràng không?
+- Comments: Có cần thêm giải thích?
 
-⚠️ **LƯU Ý**: Đưa ra đánh giá khách quan, chi tiết, có ví dụ cụ thể. Sử dụng emoji và Markdown formatting để dễ đọc.
+### 5. 💡 BEST PRACTICES
+- Tuân thủ MySQL standards
+- Transaction handling (nếu UPDATE/DELETE)
+- LIMIT clause cho large datasets
+- Explicit column names thay vì *
+
+### 6. ✏️ QUERY TỐI ƯU (nếu cần cải thiện)
+Chỉ viết lại nếu có thể tối ưu đáng kể. Giải thích ngắn gọn các thay đổi.
+
+---
+
+**HƯỚNG DẪN TRẢ LỜI:**
+- ✅ Sử dụng emoji và Markdown
+- ✅ Ngắn gọn, đi thẳng vào vấn đề
+- ✅ Ưu tiên các issues quan trọng nhất
+- ✅ Đưa ra lý do cụ thể cho mỗi đề xuất
+- ❌ Không dài dòng, không lặp lại thông tin
+- ❌ Bỏ qua nếu query đã tối ưu (không cần khen ngợi thừa)
 
 BẮT ĐẦU REVIEW:
 """
@@ -3276,6 +3326,7 @@ Params: param:[1-1][2-○][3-][4-JPN]
                     writer = csv.writer(f)
                     
                     # Write headers
+                    headers = [self.results_table.horizontalHeaderItem(i).text() if self.results_table.horizontalHeaderItem(i) else f'Column{i}' # type: ignore
                               for i in range(self.results_table.columnCount())]
                     writer.writerow(headers)
                     
