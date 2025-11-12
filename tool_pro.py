@@ -193,34 +193,86 @@ class ConfigManager:
 
 
 class GeminiWorker(QThread):
-    """Worker chạy trong luồng riêng để gọi API Gemini"""
+    """Worker chạy trong luồng riêng để gọi API Gemini với retry logic"""
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
     progress = pyqtSignal(str)
 
-    def __init__(self, prompt: str, model_name: str):
+    def __init__(self, prompt: str, model_name: str, max_retries: int = 3):
         super().__init__()
         self.prompt = prompt
         self.model_name = model_name
+        self.max_retries = max_retries
 
     def run(self):
-        """Thực thi call tới Gemini trong thread với logging và bắt lỗi an toàn."""
-        try:
-            logger.info("GeminiWorker started: model=%s", self.model_name)
-            self.progress.emit('Đang kết nối với Gemini AI...')
-            
-            model = GenerativeModel(self.model_name)
-            
-            self.progress.emit('Đang phân tích SQL query...')
-            response = model.generate_content(self.prompt)
-            text = getattr(response, 'text', '') or ''
-            self.progress.emit('Hoàn thành!')
-            
-            logger.info("GeminiWorker success, received %d chars", len(text))
-            self.finished.emit(text)
-        except Exception as e:
-            logger.error("GeminiWorker error: %s\n%s", e, traceback.format_exc())
-            self.error.emit(str(e))
+        """Thực thi call tới Gemini với retry logic và rate limit handling"""
+        import time
+        import re
+        
+        for attempt in range(self.max_retries):
+            try:
+                logger.info("GeminiWorker attempt %d/%d: model=%s", attempt + 1, self.max_retries, self.model_name)
+                
+                if attempt > 0:
+                    self.progress.emit(f'Đang thử lại... (lần {attempt + 1}/{self.max_retries})')
+                else:
+                    self.progress.emit('Đang kết nối với Gemini AI...')
+                
+                model = GenerativeModel(self.model_name)
+                
+                self.progress.emit('Đang phân tích SQL query...')
+                response = model.generate_content(self.prompt)
+                text = getattr(response, 'text', '') or ''
+                self.progress.emit('Hoàn thành!')
+                
+                logger.info("GeminiWorker success, received %d chars", len(text))
+                self.finished.emit(text)
+                return  # Success, exit
+                
+            except Exception as e:
+                error_str = str(e)
+                logger.error("GeminiWorker error (attempt %d): %s\n%s", attempt + 1, error_str, traceback.format_exc())
+                
+                # Check if it's a quota/rate limit error (429)
+                if '429' in error_str or 'quota' in error_str.lower() or 'rate limit' in error_str.lower():
+                    # Extract retry delay from error message
+                    retry_match = re.search(r'retry in (\d+\.?\d*)', error_str.lower())
+                    if retry_match:
+                        retry_delay = float(retry_match.group(1))
+                    else:
+                        retry_delay = 30  # Default 30s
+                    
+                    if attempt < self.max_retries - 1:
+                        self.progress.emit(f'⚠️ Quota exceeded. Đang chờ {int(retry_delay)}s...')
+                        logger.warning("Rate limit hit, waiting %ds before retry", retry_delay)
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        # Last attempt failed
+                        error_msg = (
+                            f'❌ Gemini API Quota Exceeded\n\n'
+                            f'Bạn đã vượt quá giới hạn 250,000 tokens/phút (Free Tier).\n\n'
+                            f'💡 Giải pháp:\n'
+                            f'• Đợi {int(retry_delay)}s rồi thử lại\n'
+                            f'• Giảm độ dài SQL query\n'
+                            f'• Upgrade lên paid plan tại: https://ai.google.dev/pricing\n'
+                            f'• Kiểm tra usage tại: https://ai.dev/usage?tab=rate-limit\n\n'
+                            f'📊 Free Tier Limits:\n'
+                            f'• 15 requests/phút\n'
+                            f'• 1,500 requests/ngày\n'
+                            f'• 250,000 tokens/phút'
+                        )
+                        self.error.emit(error_msg)
+                        return
+                
+                # Other errors (not rate limit)
+                if attempt < self.max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                    self.progress.emit(f'Lỗi. Thử lại sau {wait_time}s...')
+                    time.sleep(wait_time)
+                else:
+                    # Last attempt, emit error
+                    self.error.emit(error_str)
 
 
 class ExecuteQueryWorker(QThread):
@@ -277,32 +329,64 @@ class ExecuteQueryWorker(QThread):
 
 
 class ChatWorker(QThread):
-    """Worker thread for Gemini chat to prevent UI freezing."""
+    """Worker thread for Gemini chat với retry logic"""
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, history: list, model_name: str):
+    def __init__(self, history: list, model_name: str, max_retries: int = 3):
         super().__init__()
         self.history = history
         self.model_name = model_name
+        self.max_retries = max_retries
 
     def run(self):
-        try:
-            logger.info("ChatWorker started, history length: %d", len(self.history))
-            model = GenerativeModel(self.model_name)
-            
-            # Start a chat session with history
-            chat = model.start_chat(history=self.history[:-1]) # History excluding the last user message
-            last_message = self.history[-1]['parts'][0]
-            
-            response = chat.send_message(last_message)
-            
-            text = getattr(response, 'text', '') or ''
-            logger.info("ChatWorker success, received %d chars", len(text))
-            self.finished.emit(text)
-        except Exception as e:
-            logger.error("ChatWorker exception: %s\n%s", e, traceback.format_exc())
-            self.error.emit(f'Lỗi khi gọi Gemini: {str(e)}')
+        import time
+        import re
+        
+        for attempt in range(self.max_retries):
+            try:
+                logger.info("ChatWorker attempt %d/%d, history length: %d", attempt + 1, self.max_retries, len(self.history))
+                model = GenerativeModel(self.model_name)
+                
+                # Start a chat session with history
+                chat = model.start_chat(history=self.history[:-1])  # History excluding the last user message
+                last_message = self.history[-1]['parts'][0]
+                
+                response = chat.send_message(last_message)
+                
+                text = getattr(response, 'text', '') or ''
+                logger.info("ChatWorker success, received %d chars", len(text))
+                self.finished.emit(text)
+                return  # Success
+                
+            except Exception as e:
+                error_str = str(e)
+                logger.error("ChatWorker exception (attempt %d): %s\n%s", attempt + 1, error_str, traceback.format_exc())
+                
+                # Check for quota/rate limit error
+                if '429' in error_str or 'quota' in error_str.lower() or 'rate limit' in error_str.lower():
+                    retry_match = re.search(r'retry in (\d+\.?\d*)', error_str.lower())
+                    retry_delay = float(retry_match.group(1)) if retry_match else 30
+                    
+                    if attempt < self.max_retries - 1:
+                        logger.warning("Chat rate limit hit, waiting %ds", retry_delay)
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        error_msg = (
+                            f'❌ Gemini API Quota Exceeded (Chat)\n\n'
+                            f'Đợi {int(retry_delay)}s hoặc upgrade plan.\n\n'
+                            f'Free Tier: 15 req/min, 1,500 req/day'
+                        )
+                        self.error.emit(error_msg)
+                        return
+                
+                # Other errors
+                if attempt < self.max_retries - 1:
+                    wait_time = 2 ** attempt
+                    time.sleep(wait_time)
+                else:
+                    self.error.emit(f'Lỗi khi gọi Gemini: {error_str}')
 
 
 class LoadingOverlay(QWidget):
@@ -348,7 +432,7 @@ class LoadingOverlay(QWidget):
         
         self.setLayout(layout)
     
-    def paintEvent(self, e):
+    def paintEvent(self, e): # type: ignore
         """Draw spinning circle"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -383,10 +467,10 @@ class LoadingOverlay(QWidget):
         self.angle = (self.angle + 10) % 360
         self.update()
     
-    def show_loading(self, message="Đang xử lý...", show_background=True):
+    def show_loading(self, message="Đang xử lý...", show_background=False):
         """Show loading overlay"""
         self.message = message
-        self._show_background = show_background
+        self._show_background = False
         self.loading_label.setText(f"🤖 {message}")
         
         parent_widget = self.parent()
@@ -494,7 +578,7 @@ class SQLEditorWithAutocomplete(QTextEdit):
     def insert_completion(self, completion: str):
         """Insert selected completion at cursor"""
         tc = self.textCursor()
-        extra = len(completion) - len(self.completer.completionPrefix())
+        extra = len(completion) - len(self.completer.completionPrefix()) # type: ignore
         tc.movePosition(tc.MoveOperation.Left)
         tc.movePosition(tc.MoveOperation.EndOfWord)
         tc.insertText(completion[-extra:])
@@ -512,14 +596,14 @@ class SQLEditorWithAutocomplete(QTextEdit):
         
         # If completer is visible and special keys pressed
         if self.completer and self.completer.popup().isVisible():
-            if e.key() in (
+            if e.key() in ( # type: ignore
                 Qt.Key.Key_Enter,
                 Qt.Key.Key_Return,
                 Qt.Key.Key_Escape,
                 Qt.Key.Key_Tab,
                 Qt.Key.Key_Backtab
             ):
-                e.ignore()
+                e.ignore() # type: ignore
                 return
         
         # Handle normal key press
@@ -2143,6 +2227,27 @@ class SQLReviewerApp(QMainWindow):
             if reply == QMessageBox.StandardButton.No:
                 return
         
+        # Estimate tokens and warn if too large
+        prompt = self.build_enhanced_prompt(sql_query)
+        estimated_tokens = len(prompt.split())  # Rough estimate: 1 token ≈ 1 word
+        
+        if estimated_tokens > 5000:  # Warning for large prompts
+            reply = QMessageBox.warning(self, 'Prompt quá lớn',
+                f'⚠️ Prompt ước tính ~{estimated_tokens:,} tokens\n\n' +
+                f'Free Tier Gemini giới hạn:\n' +
+                f'• 250,000 tokens/phút\n' +
+                f'• 15 requests/phút\n\n' +
+                f'Prompt lớn có thể:\n' +
+                f'• Tốn quota nhanh\n' +
+                f'• Dễ bị rate limit\n' +
+                f'• Response chậm hơn\n\n' +
+                f'💡 Đề xuất: Rút gọn SQL hoặc schema\n\n' +
+                f'Bạn có muốn tiếp tục?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.No:
+                return
+        
         # Show raw SQL in tab
         self.raw_sql_output.setText(sql_query)
         
@@ -2154,8 +2259,7 @@ class SQLReviewerApp(QMainWindow):
         self.result_output.setText('⏳ Đang liên hệ với Gemini AI... Vui lòng chờ...')
         self.status_bar.showMessage('Đang phân tích SQL...')
         
-        # Build prompt and start worker
-        prompt = self.build_enhanced_prompt(sql_query)
+        # Use already built prompt (from token estimation above)
         model_name = self.config_manager.get_model()
         
         self.gemini_worker = GeminiWorker(prompt, model_name)
@@ -2194,31 +2298,122 @@ class SQLReviewerApp(QMainWindow):
         self.gemini_worker = None
         self.status_bar.showMessage('❌ Review thất bại', 3000)
     
+    def extract_table_names_from_sql(self, sql_query: str) -> set:
+        """Extract table names from SQL query"""
+        import re
+        
+        # Remove comments and strings
+        sql_clean = re.sub(r'--[^\n]*', '', sql_query)  # Remove -- comments
+        sql_clean = re.sub(r'/\*.*?\*/', '', sql_clean, flags=re.DOTALL)  # Remove /* */ comments
+        sql_clean = re.sub(r"'[^']*'", '', sql_clean)  # Remove string literals
+        sql_clean = re.sub(r'"[^"]*"', '', sql_clean)  # Remove quoted strings
+        
+        tables = set()
+        
+        # Pattern 1: FROM/JOIN table_name (with optional alias)
+        # Matches: FROM users, JOIN orders o, FROM `table_name`
+        pattern_from_join = r'\b(?:FROM|JOIN|INTO|UPDATE)\s+`?([a-zA-Z0-9_]+)`?(?:\s+(?:AS\s+)?[a-zA-Z0-9_]+)?'
+        matches = re.findall(pattern_from_join, sql_clean, re.IGNORECASE)
+        tables.update(matches)
+        
+        # Pattern 2: table.column format
+        # Matches: users.id, orders.user_id
+        pattern_table_dot = r'\b([a-zA-Z0-9_]+)\.[a-zA-Z0-9_]+'
+        matches = re.findall(pattern_table_dot, sql_clean)
+        tables.update(matches)
+        
+        # Filter out SQL keywords
+        sql_keywords = {
+            'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'FROM', 'WHERE', 'JOIN', 'LEFT', 'RIGHT',
+            'INNER', 'OUTER', 'FULL', 'CROSS', 'ON', 'AND', 'OR', 'NOT', 'IN', 'EXISTS',
+            'BETWEEN', 'LIKE', 'IS', 'NULL', 'AS', 'BY', 'GROUP', 'ORDER', 'HAVING',
+            'LIMIT', 'OFFSET', 'UNION', 'ALL', 'DISTINCT', 'COUNT', 'SUM', 'AVG', 'MIN', 'MAX',
+            'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'WITH', 'RECURSIVE', 'VALUES', 'SET'
+        }
+        
+        # Remove keywords and invalid names
+        tables = {t for t in tables if t.upper() not in sql_keywords and t.strip()}
+        
+        return tables
+    
     def build_enhanced_prompt(self, sql_query: str) -> str:
-        """Xây dựng prompt nâng cao cho Gemini"""
+        """Xây dựng prompt nâng cao cho Gemini - chỉ include các bảng liên quan"""
+        import re
+        
         schema_string = ""
+        relationship_string = ""
         
         if self.db_schema:
-            for table, columns in self.db_schema.items():
-                schema_string += f"📋 **Bảng {table}**:\n"
-                for col in columns:
-                    col_info = f"  - `{col['name']}` ({col['type']})"
-                    if col['key'] == 'PRI':
-                        col_info += " [PRIMARY KEY]"
-                    if col['nullable'] == 'NO':
-                        col_info += " [NOT NULL]"
-                    if 'auto_increment' in col['extra'].lower():
-                        col_info += " [AUTO_INCREMENT]"
-                    if col['comment']:
-                        col_info += f" // {col['comment']}"
-                    schema_string += col_info + "\n"
-                schema_string += "\n"
+            # Extract table names from SQL query
+            query_tables = self.extract_table_names_from_sql(sql_query)
+            
+            # Find related tables (through foreign keys)
+            related_tables = set(query_tables)
+            if self.db_relationships:
+                for table in list(query_tables):
+                    if table in self.db_relationships:
+                        rel = self.db_relationships[table]
+                        # Add parent tables (referenced)
+                        for ref in rel.get('references', []):
+                            if ref.get('referenced_table'):
+                                related_tables.add(ref['referenced_table'])
+                        # Add child tables (referencing)
+                        for ref in rel.get('referenced_by', []):
+                            if ref.get('table'):
+                                related_tables.add(ref['table'])
+            
+            # Filter schema to only include related tables
+            filtered_tables = {k: v for k, v in self.db_schema.items() if k in related_tables}
+            
+            if filtered_tables:
+                schema_string += f"📊 **Các bảng liên quan** ({len(filtered_tables)}/{len(self.db_schema)} bảng):\n\n"
+                for table, columns in filtered_tables.items():
+                    schema_string += f"📋 **Bảng {table}**:\n"
+                    for col in columns:
+                        col_info = f"  - `{col['name']}` ({col['type']})"
+                        if col['key'] == 'PRI':
+                            col_info += " [PRIMARY KEY]"
+                        if col['nullable'] == 'NO':
+                            col_info += " [NOT NULL]"
+                        if 'auto_increment' in col['extra'].lower():
+                            col_info += " [AUTO_INCREMENT]"
+                        if col['comment']:
+                            col_info += f" // {col['comment']}"
+                        schema_string += col_info + "\n"
+                    schema_string += "\n"
+                
+                # Show excluded tables info
+                excluded_count = len(self.db_schema) - len(filtered_tables)
+                if excluded_count > 0:
+                    schema_string += f"ℹ️ *({excluded_count} bảng khác không liên quan đã được loại bỏ để tối ưu)*\n\n"
+            else:
+                # No tables detected, show warning but include all
+                schema_string += "⚠️ **Không detect được bảng trong SQL. Hiển thị tất cả:**\n\n"
+                for table, columns in self.db_schema.items():
+                    schema_string += f"📋 **Bảng {table}**:\n"
+                    for col in columns:
+                        col_info = f"  - `{col['name']}` ({col['type']})"
+                        if col['key'] == 'PRI':
+                            col_info += " [PRIMARY KEY]"
+                        if col['nullable'] == 'NO':
+                            col_info += " [NOT NULL]"
+                        if 'auto_increment' in col['extra'].lower():
+                            col_info += " [AUTO_INCREMENT]"
+                        if col['comment']:
+                            col_info += f" // {col['comment']}"
+                        schema_string += col_info + "\n"
+                    schema_string += "\n"
         else:
             schema_string = "⚠️ Không có thông tin schema database.\n"
+            related_tables = set()  # Empty set if no schema
         
-        if self.db_relationships:
+        # Build relationships only for related tables
+        if self.db_relationships and related_tables:
             relationship_lines = []
-            for table, rel in self.db_relationships.items():
+            for table in related_tables:
+                if table not in self.db_relationships:
+                    continue
+                rel = self.db_relationships[table]
                 parents = rel.get('references', [])
                 children = rel.get('referenced_by', [])
                 if not parents and not children:
@@ -2234,7 +2429,7 @@ class SQLReviewerApp(QMainWindow):
                 relationship_lines.append(
                     f"- **{table}** | Cha: {parent_desc} | Con: {child_desc}"
                 )
-            relationship_string = "\n".join(relationship_lines) if relationship_lines else "⚠️ Không có thông tin quan hệ khóa ngoại.\n"
+            relationship_string = "\n".join(relationship_lines) if relationship_lines else "⚠️ Không có quan hệ khóa ngoại.\n"
         else:
             relationship_string = "⚠️ Không có thông tin quan hệ khóa ngoại.\n"
         
@@ -3081,13 +3276,12 @@ Params: param:[1-1][2-○][3-][4-JPN]
                     writer = csv.writer(f)
                     
                     # Write headers
-                    headers = [self.results_table.horizontalHeaderItem(i).text() 
                               for i in range(self.results_table.columnCount())]
                     writer.writerow(headers)
                     
                     # Write rows
                     for row in range(self.results_table.rowCount()):
-                        row_data = [self.results_table.item(row, col).text() if self.results_table.item(row, col) else ''
+                        row_data = [self.results_table.item(row, col).text() if self.results_table.item(row, col) else '' # type: ignore
                                    for col in range(self.results_table.columnCount())]
                         writer.writerow(row_data)
                 
@@ -3107,11 +3301,7 @@ Params: param:[1-1][2-○][3-][4-JPN]
     def open_ai_chat(self):
         """Mở dialog chat với Gemini AI"""
         if not hasattr(self, 'ai_chat_dialog') or not self.ai_chat_dialog:
-            self.ai_chat_dialog = AIChatDialog(self.config_manager, self)
-        
-        # Update schema for context
-        if self.db_schema:
-            self.ai_chat_dialog.update_database_context(self.db_schema)
+            self.ai_chat_dialog = AIChatDialog(self)  # Only pass parent
         
         self.ai_chat_dialog.show()
         self.ai_chat_dialog.raise_()
