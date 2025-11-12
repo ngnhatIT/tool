@@ -208,6 +208,7 @@ class GeminiWorker(QThread):
         try:
             logger.info("GeminiWorker started: model=%s", self.model_name)
             self.progress.emit('Đang kết nối với Gemini AI...')
+            
             model = GenerativeModel(self.model_name)
             
             self.progress.emit('Đang phân tích SQL query...')
@@ -219,6 +220,59 @@ class GeminiWorker(QThread):
             self.finished.emit(text)
         except Exception as e:
             logger.error("GeminiWorker error: %s\n%s", e, traceback.format_exc())
+            self.error.emit(str(e))
+
+
+class ExecuteQueryWorker(QThread):
+    """Worker thread for executing SQL queries safely"""
+    finished = pyqtSignal(list, list, float)  # columns, rows, execution_time
+    error = pyqtSignal(str)
+    progress = pyqtSignal(str)
+    
+    def __init__(self, connection, query: str):
+        super().__init__()
+        self.connection = connection
+        self.query = query
+        self.start_time = 0.0
+    
+    def run(self):
+        """Execute query in separate thread"""
+        import time
+        
+        try:
+            self.progress.emit('Đang thực thi query...')
+            
+            cursor = self.connection.cursor()
+            self.start_time = time.time()
+            
+            cursor.execute(self.query)
+            
+            execution_time = time.time() - self.start_time
+            
+            # Check if query returns results (SELECT, SHOW, DESCRIBE, etc.)
+            if cursor.description:
+                # Get column names
+                columns = [desc[0] for desc in cursor.description]
+                
+                # Fetch all rows
+                rows = cursor.fetchall()
+                
+                self.progress.emit(f'Đã tải {len(rows)} rows...')
+                self.finished.emit(columns, rows, execution_time)
+            else:
+                # For INSERT/UPDATE/DELETE - no results
+                affected_rows = cursor.rowcount
+                self.connection.commit()
+                
+                columns = ['Result']
+                rows = [[f'✅ Query executed successfully. {affected_rows} row(s) affected.']]
+                
+                self.finished.emit(columns, rows, execution_time)
+            
+            cursor.close()
+            
+        except Exception as e:
+            logger.error("Execute query error: %s", str(e))
             self.error.emit(str(e))
 
 
@@ -294,7 +348,7 @@ class LoadingOverlay(QWidget):
         
         self.setLayout(layout)
     
-    def paintEvent(self, a0):
+    def paintEvent(self, e):
         """Draw spinning circle"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -332,7 +386,7 @@ class LoadingOverlay(QWidget):
     def show_loading(self, message="Đang xử lý...", show_background=True):
         """Show loading overlay"""
         self.message = message
-        self._show_background = False
+        self._show_background = show_background
         self.loading_label.setText(f"🤖 {message}")
         
         parent_widget = self.parent()
@@ -352,6 +406,142 @@ class LoadingOverlay(QWidget):
         """Update loading message"""
         self.message = message
         self.loading_label.setText(f"🤖 {message}")
+
+
+class SQLEditorWithAutocomplete(QTextEdit):
+    """Custom QTextEdit with SQL auto-complete suggestions"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.completer: Optional[Any] = None
+        self.db_schema: Dict[str, List[Dict[str, Any]]] = {}
+        
+        # SQL Keywords
+        self.sql_keywords = [
+            'SELECT', 'FROM', 'WHERE', 'JOIN', 'INNER JOIN', 'LEFT JOIN', 'RIGHT JOIN',
+            'GROUP BY', 'ORDER BY', 'HAVING', 'LIMIT', 'OFFSET', 'DISTINCT',
+            'INSERT INTO', 'VALUES', 'UPDATE', 'SET', 'DELETE FROM',
+            'CREATE TABLE', 'ALTER TABLE', 'DROP TABLE', 'TRUNCATE',
+            'AND', 'OR', 'NOT', 'IN', 'BETWEEN', 'LIKE', 'IS NULL', 'IS NOT NULL',
+            'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'AS', 'ON', 'USING'
+        ]
+        
+        self.setup_completer()
+    
+    def setup_completer(self):
+        """Setup QCompleter với suggestions"""
+        from PyQt6.QtWidgets import QCompleter
+        from PyQt6.QtCore import Qt, QStringListModel
+        
+        # Initial suggestions (keywords only)
+        suggestions = self.sql_keywords.copy()
+        
+        self.completer = QCompleter(suggestions, self)
+        self.completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.completer.setWidget(self)
+        self.completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self.completer.activated.connect(self.insert_completion)
+        
+        # Style completer popup
+        self.completer.popup().setStyleSheet(f"""
+            QListView {{
+                background-color: white;
+                border: 2px solid {COLORS['primary']};
+                border-radius: 4px;
+                padding: 4px;
+                font-size: 13px;
+                color: {COLORS['text_primary']};
+            }}
+            QListView::item {{
+                padding: 6px 10px;
+                border-radius: 3px;
+            }}
+            QListView::item:selected {{
+                background-color: {COLORS['primary']};
+                color: white;
+            }}
+            QListView::item:hover {{
+                background-color: {COLORS['bg_hover']};
+            }}
+        """)
+    
+    def update_schema(self, db_schema: Dict[str, List[Dict[str, Any]]]):
+        """Update schema for auto-complete suggestions"""
+        self.db_schema = db_schema
+        self.update_suggestions()
+    
+    def update_suggestions(self):
+        """Update completer with tables and columns from schema"""
+        suggestions = self.sql_keywords.copy()
+        
+        # Add table names
+        for table_name in self.db_schema.keys():
+            suggestions.append(table_name)
+        
+        # Add columns (with table prefix)
+        for table_name, columns in self.db_schema.items():
+            for col in columns:
+                col_name = col['name']
+                suggestions.append(col_name)
+                suggestions.append(f"{table_name}.{col_name}")
+        
+        # Update completer model
+        from PyQt6.QtCore import QStringListModel
+        model = QStringListModel(suggestions)
+        if self.completer:
+            self.completer.setModel(model)
+    
+    def insert_completion(self, completion: str):
+        """Insert selected completion at cursor"""
+        tc = self.textCursor()
+        extra = len(completion) - len(self.completer.completionPrefix())
+        tc.movePosition(tc.MoveOperation.Left)
+        tc.movePosition(tc.MoveOperation.EndOfWord)
+        tc.insertText(completion[-extra:])
+        self.setTextCursor(tc)
+    
+    def text_under_cursor(self) -> str:
+        """Get word under cursor"""
+        tc = self.textCursor()
+        tc.select(tc.SelectionType.WordUnderCursor)
+        return tc.selectedText()
+    
+    def keyPressEvent(self, e):
+        """Handle key press for auto-complete"""
+        from PyQt6.QtCore import Qt
+        
+        # If completer is visible and special keys pressed
+        if self.completer and self.completer.popup().isVisible():
+            if e.key() in (
+                Qt.Key.Key_Enter,
+                Qt.Key.Key_Return,
+                Qt.Key.Key_Escape,
+                Qt.Key.Key_Tab,
+                Qt.Key.Key_Backtab
+            ):
+                e.ignore()
+                return
+        
+        # Handle normal key press
+        super().keyPressEvent(e)
+        
+        # Get current text under cursor
+        completion_prefix = self.text_under_cursor()
+        
+        # Show completer if prefix length >= 2
+        if self.completer and len(completion_prefix) >= 2:
+            self.completer.setCompletionPrefix(completion_prefix)
+            popup = self.completer.popup()
+            popup.setCurrentIndex(self.completer.completionModel().index(0, 0))
+            
+            # Position popup
+            cr = self.cursorRect()
+            cr.setWidth(self.completer.popup().sizeHintForColumn(0)
+                       + self.completer.popup().verticalScrollBar().sizeHint().width())
+            self.completer.complete(cr)
+        else:
+            if self.completer:
+                self.completer.popup().hide()
 
 
 class AIChatDialog(QDialog):
@@ -1116,6 +1306,120 @@ class SQLReviewerApp(QMainWindow):
         
         self.result_tabs.addTab(bind_widget, qta.icon('fa5s.plug'), 'Bind Parameters')
         
+        # Tab 4: Execute Query (NEW - với auto-complete)
+        execute_widget = QWidget()
+        execute_layout = QVBoxLayout()
+        execute_widget.setLayout(execute_layout)
+        
+        # SQL Editor với Auto-complete
+        execute_layout.addWidget(QLabel('<b>🚀 SQL Query Editor (với Auto-complete):</b>'))
+        self.execute_sql_input = SQLEditorWithAutocomplete()
+        self.execute_sql_input.setPlaceholderText(
+            'SELECT * FROM users LIMIT 10;\n\n' +
+            '💡 Tips:\n' +
+            '  - Gõ từ 2 ký tự để hiện auto-complete\n' +
+            '  - Hỗ trợ: SQL keywords, table names, column names\n' +
+            '  - Tab/Enter để chọn suggestion'
+        )
+        self.execute_sql_input.setFont(QFont(FONT_COURIER_NEW, 10))
+        self.execute_sql_input.setMinimumHeight(150)
+        execute_layout.addWidget(self.execute_sql_input)
+        
+        # Execute buttons
+        exec_btn_layout = QHBoxLayout()
+        
+        self.execute_button = QPushButton(' Execute Query')
+        self.execute_button.setIcon(qta.icon('fa5s.play', color=COLORS['text_white']))
+        self.execute_button.clicked.connect(lambda: self.execute_sql_query())
+        self.execute_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['success']};
+                color: {COLORS['text_white']};
+                padding: 10px 20px;
+                font-size: 13px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: {COLORS['success_hover']};
+            }}
+        """)
+        exec_btn_layout.addWidget(self.execute_button)
+        
+        self.clear_exec_btn = QPushButton(' Clear')
+        self.clear_exec_btn.setIcon(qta.icon('fa5s.eraser', color=COLORS['text_white']))
+        self.clear_exec_btn.clicked.connect(self.clear_execute_results)
+        self.clear_exec_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['text_secondary']};
+                color: {COLORS['text_white']};
+                padding: 10px 20px;
+                font-size: 13px;
+            }}
+        """)
+        exec_btn_layout.addWidget(self.clear_exec_btn)
+        
+        self.export_csv_btn = QPushButton(' Export CSV')
+        self.export_csv_btn.setIcon(qta.icon('fa5s.file-csv', color=COLORS['text_white']))
+        self.export_csv_btn.clicked.connect(self.export_results_csv)
+        self.export_csv_btn.setEnabled(False)
+        self.export_csv_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['secondary']};
+                color: {COLORS['text_white']};
+                padding: 10px 20px;
+                font-size: 13px;
+            }}
+        """)
+        exec_btn_layout.addWidget(self.export_csv_btn)
+        
+        exec_btn_layout.addStretch()
+        execute_layout.addLayout(exec_btn_layout)
+        
+        # Execution info label
+        self.exec_info_label = QLabel('💡 Nhập SQL query và click Execute để xem kết quả')
+        self.exec_info_label.setStyleSheet(f"""
+            QLabel {{
+                background-color: #eff6ff;
+                border: 2px solid {COLORS['border']};
+                border-radius: 6px;
+                padding: 10px;
+                font-size: 12px;
+                color: {COLORS['text_secondary']};
+            }}
+        """)
+        execute_layout.addWidget(self.exec_info_label)
+        
+        # Results table
+        execute_layout.addWidget(QLabel('<b>📊 Results:</b>'))
+        from PyQt6.QtWidgets import QTableWidget
+        self.results_table = QTableWidget()
+        self.results_table.setAlternatingRowColors(True)
+        self.results_table.setStyleSheet(f"""
+            QTableWidget {{
+                background-color: white;
+                border: 2px solid {COLORS['border']};
+                border-radius: 6px;
+                gridline-color: {COLORS['border']};
+            }}
+            QTableWidget::item {{
+                padding: 5px;
+            }}
+            QTableWidget::item:selected {{
+                background-color: {COLORS['primary']};
+                color: white;
+            }}
+            QHeaderView::section {{
+                background-color: {COLORS['tree_header']};
+                color: {COLORS['text_primary']};
+                padding: 8px;
+                border: none;
+                font-weight: bold;
+            }}
+        """)
+        execute_layout.addWidget(self.results_table)
+        
+        self.result_tabs.addTab(execute_widget, qta.icon('fa5s.database'), 'Execute Query')
+        
         right_layout.addWidget(self.result_tabs)
         
         # Add widgets to splitter
@@ -1464,6 +1768,20 @@ class SQLReviewerApp(QMainWindow):
         text = self.auth_plugin_input.currentText().strip()
         return text or None
     
+    def is_connection_info_changed(self) -> bool:
+        """Kiểm tra xem thông tin connection có thay đổi so với connection hiện tại không"""
+        last_conn = self.config_manager.get_last_connection()
+        if not last_conn:
+            return True  # Chưa có connection nào được lưu
+        
+        # So sánh từng field
+        return (
+            self.db_host_input.text() != last_conn.get('host', '') or
+            self.db_port_input.text() != last_conn.get('port', '') or
+            self.db_name_input.text() != last_conn.get('database', '') or
+            self.db_user_input.text() != last_conn.get('user', '')
+        )
+    
     @safe_execute
     def test_connection(self):
         """Test kết nối database"""
@@ -1547,6 +1865,10 @@ class SQLReviewerApp(QMainWindow):
             
             self.current_schema = self.db_schema
             
+            # Update auto-complete suggestions for Execute Query tab
+            if hasattr(self, 'execute_sql_input'):
+                self.execute_sql_input.update_schema(self.db_schema)
+            
             self.config_manager.save_last_connection({
                 'host': self.db_host_input.text(),
                 'port': self.db_port_input.text(),
@@ -1559,7 +1881,8 @@ class SQLReviewerApp(QMainWindow):
                 '✅ Đã kết nối và tải schema thành công!\n\n' +
                 f'📊 Database: {self.db_name_input.text()}\n' +
                 f'📋 Số bảng: {len(self.db_schema)}\n\n' +
-                '💡 Bạn có thể xem chi tiết cấu trúc ở panel bên trái.')
+                '💡 Bạn có thể xem chi tiết cấu trúc ở panel bên trái.\n' +
+                '💡 Auto-complete đã được cập nhật cho tab Execute Query!')
             self.status_bar.showMessage(f'✅ Đã load {len(self.db_schema)} bảng', 3000)
             
         except ValueError as e:
@@ -1778,6 +2101,37 @@ class SQLReviewerApp(QMainWindow):
                 '⚠️ Vui lòng nhập câu lệnh SQL để review\n\n' +
                 '💡 Bạn có thể paste SQL query của mình vào ô input phía trên.')
             return
+        
+        # Kiểm tra xem thông tin DB có thay đổi không
+        if self.db_schema and self.is_connection_info_changed():
+            reply = QMessageBox.warning(self, 'Thông tin DB đã thay đổi',
+                '⚠️ Thông tin database đã thay đổi!\n\n' +
+                'Schema hiện tại không khớp với database mới.\n' +
+                'Bạn cần Load Schema lại để review chính xác.\n\n' +
+                'Bạn có muốn:\n' +
+                '• YES: Load Schema lại (khuyến nghị)\n' +
+                '• NO: Tiếp tục với schema cũ (có thể sai)',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes)
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                # Clear schema cũ và yêu cầu load lại
+                self.db_schema = {}
+                self.db_relationships = {}
+                self.schema_tree.clear()
+                if self.db_conn:
+                    try:
+                        self.db_conn.close()
+                    except:
+                        pass
+                    self.db_conn = None
+                
+                QMessageBox.information(self, 'Schema đã được xóa',
+                    '✅ Schema cũ đã được xóa\n\n' +
+                    '💡 Vui lòng click "Load Schema" để load schema mới,\n' +
+                    'sau đó thử Review lại.')
+                return
+            # Nếu chọn NO, tiếp tục với schema cũ (có cảnh báo)
         
         if not self.db_schema:
             reply = QMessageBox.question(self, 'Không có Schema',
@@ -2137,7 +2491,7 @@ BẮT ĐẦU REVIEW:
             try:
                 # Test với Gemini API
                 configure(api_key=api_key)
-                model = GenerativeModel('gemini-1.5-flash')
+                model = GenerativeModel('gemini-2.5-flash')
                 model.generate_content('Hello')
                 
                 QMessageBox.information(
@@ -2379,6 +2733,14 @@ Params: param:[1-1][2-○][3-][4-JPN]
                 QMessageBox.warning(self, MSG_MISSING_DATA, 'Vui lòng nhập parameters!')
                 return
             
+            # Kiểm tra connection info có thay đổi không
+            if self.db_schema and self.is_connection_info_changed():
+                QMessageBox.warning(self, 'Thông tin DB đã thay đổi',
+                    '⚠️ Thông tin database đã thay đổi!\n\n' +
+                    'Schema hiện tại không khớp với database mới.\n\n' +
+                    '💡 Vui lòng Load Schema lại để validation chính xác.')
+                # Vẫn tiếp tục bind nhưng không có type validation
+            
             # Count placeholders
             placeholder_count = sql.count('?')
             
@@ -2543,34 +2905,233 @@ Params: param:[1-1][2-○][3-][4-JPN]
                 QMessageBox.information(
                     self,
                     '✅ Đã copy',
-                    '📋 SQL query đã được copy vào clipboard!'
+                    '✅ Đã copy kết quả vào clipboard!'
                 )
-            else:
-                QMessageBox.warning(
-                    self,
-                    '❌ Lỗi clipboard',
-                    'Không thể truy cập clipboard!'
-                )
+    
+    @safe_execute
+    def execute_sql_query(self):
+        """Execute SQL query và hiển thị kết quả trong table"""
+        query = self.execute_sql_input.toPlainText().strip()
+        
+        if not query:
+            QMessageBox.warning(self, 'SQL Trống', 
+                '⚠️ Vui lòng nhập SQL query để thực thi!')
+            return
+        
+        # Kiểm tra connection info có thay đổi không
+        if self.db_conn and self.is_connection_info_changed():
+            reply = QMessageBox.warning(self, 'Thông tin DB đã thay đổi',
+                '⚠️ Thông tin database đã thay đổi!\n\n' +
+                'Connection hiện tại không khớp với database mới.\n\n' +
+                'Vui lòng Load Schema lại trước khi thực thi query.',
+                QMessageBox.StandardButton.Ok)
+            return
+        
+        if not self.db_conn:
+            reply = QMessageBox.question(self, 'Chưa kết nối Database',
+                '⚠️ Chưa kết nối tới database!\n\n' +
+                'Bạn có muốn kết nối ngay bây giờ?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                self.load_schema()
+            return
+        
+        # Warning for DML/DDL queries
+        query_upper = query.upper().strip()
+        if any(keyword in query_upper for keyword in ['INSERT', 'UPDATE', 'DELETE', 'DROP', 'TRUNCATE', 'ALTER']):
+            reply = QMessageBox.warning(
+                self,
+                '⚠️ Cảnh báo: Query thay đổi dữ liệu',
+                f'⚠️ Query này sẽ THAY ĐỔI dữ liệu trong database!\n\n' +
+                f'Query: {query[:100]}...\n\n' +
+                '🔴 Hành động này KHÔNG THỂ HOÀN TÁC!\n\n' +
+                'Bạn có chắc muốn tiếp tục?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.No:
+                return
+        
+        # Show loading
+        self.loading_overlay.show_loading('Đang thực thi query...')
+        
+        # Disable button
+        self.execute_button.setEnabled(False)
+        self.exec_info_label.setText('⏳ Đang thực thi query...')
+        
+        # Start worker
+        self.execute_worker = ExecuteQueryWorker(self.db_conn, query)
+        self.execute_worker.finished.connect(self.on_execute_finished)
+        self.execute_worker.error.connect(self.on_execute_error)
+        self.execute_worker.progress.connect(self.on_execute_progress)
+        self.execute_worker.start()
+    
+    def on_execute_progress(self, message: str):
+        """Update progress"""
+        self.exec_info_label.setText(f'⏳ {message}')
+    
+    def on_execute_finished(self, columns: list, rows: list, execution_time: float):
+        """Display query results in table"""
+        self.loading_overlay.hide_loading()
+        
+        # Setup table
+        self.results_table.clear()
+        self.results_table.setRowCount(len(rows))
+        self.results_table.setColumnCount(len(columns))
+        self.results_table.setHorizontalHeaderLabels(columns)
+        
+        # Populate data
+        for row_idx, row in enumerate(rows):
+            for col_idx, value in enumerate(row):
+                from PyQt6.QtWidgets import QTableWidgetItem
+                item = QTableWidgetItem(str(value))
+                self.results_table.setItem(row_idx, col_idx, item)
+        
+        # Auto-resize columns
+        self.results_table.resizeColumnsToContents()
+        
+        # Update info
+        self.exec_info_label.setText(
+            f'✅ Query executed successfully | ' +
+            f'{len(rows)} rows | ' +
+            f'{len(columns)} columns | ' +
+            f'{execution_time:.3f}s'
+        )
+        self.exec_info_label.setStyleSheet(f"""
+            QLabel {{
+                background-color: #d1fae5;
+                border: 2px solid {COLORS['success']};
+                border-radius: 6px;
+                padding: 10px;
+                font-size: 12px;
+                color: {COLORS['text_primary']};
+                font-weight: bold;
+            }}
+        """)
+        
+        # Enable buttons
+        self.execute_button.setEnabled(True)
+        self.export_csv_btn.setEnabled(True)
+        self.status_bar.showMessage(f'✅ Query executed: {len(rows)} rows in {execution_time:.3f}s', 5000)
+    
+    def on_execute_error(self, error_message: str):
+        """Handle query execution error"""
+        self.loading_overlay.hide_loading()
+        
+        QMessageBox.critical(self, 'Query Error',
+            f'❌ Không thể thực thi query\n\n' +
+            f'Lỗi: {error_message}\n\n' +
+            '💡 Tips:\n' +
+            '• Kiểm tra cú pháp SQL\n' +
+            '• Kiểm tra tên table/column\n' +
+            '• Xem lại quyền truy cập database'
+        )
+        
+        self.exec_info_label.setText(f'❌ Error: {error_message[:100]}...')
+        self.exec_info_label.setStyleSheet(f"""
+            QLabel {{
+                background-color: #fee2e2;
+                border: 2px solid {COLORS['danger']};
+                border-radius: 6px;
+                padding: 10px;
+                font-size: 12px;
+                color: {COLORS['text_primary']};
+            }}
+        """)
+        
+        self.execute_button.setEnabled(True)
+        self.status_bar.showMessage('❌ Query failed', 3000)
+    
+    def clear_execute_results(self):
+        """Clear execution results"""
+        self.results_table.clear()
+        self.results_table.setRowCount(0)
+        self.results_table.setColumnCount(0)
+        self.exec_info_label.setText('💡 Nhập SQL query và click Execute để xem kết quả')
+        self.exec_info_label.setStyleSheet(f"""
+            QLabel {{
+                background-color: #eff6ff;
+                border: 2px solid {COLORS['border']};
+                border-radius: 6px;
+                padding: 10px;
+                font-size: 12px;
+                color: {COLORS['text_secondary']};
+            }}
+        """)
+        self.export_csv_btn.setEnabled(False)
+    
+    def export_results_csv(self):
+        """Export query results to CSV"""
+        if self.results_table.rowCount() == 0:
+            QMessageBox.warning(self, 'No Data', '⚠️ Không có dữ liệu để export!')
+            return
+        
+        # Get filename
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            'Export Results to CSV',
+            f'query_results_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv',
+            'CSV Files (*.csv);;All Files (*.*)'
+        )
+        
+        if filename:
+            try:
+                import csv
+                with open(filename, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    
+                    # Write headers
+                    headers = [self.results_table.horizontalHeaderItem(i).text() 
+                              for i in range(self.results_table.columnCount())]
+                    writer.writerow(headers)
+                    
+                    # Write rows
+                    for row in range(self.results_table.rowCount()):
+                        row_data = [self.results_table.item(row, col).text() if self.results_table.item(row, col) else ''
+                                   for col in range(self.results_table.columnCount())]
+                        writer.writerow(row_data)
+                
+                QMessageBox.information(self, 'Export Success',
+                    f'✅ Đã export {self.results_table.rowCount()} rows thành công!\n\n' +
+                    f'📁 File: {os.path.basename(filename)}\n' +
+                    f'📂 Thư mục: {os.path.dirname(filename)}')
+                
+                self.status_bar.showMessage(f'✅ Exported to: {os.path.basename(filename)}', 3000)
+                
+            except Exception as e:
+                QMessageBox.critical(self, 'Export Error',
+                    f'❌ Không thể export file\n\n' +
+                    f'Lỗi: {str(e)}')
     
     @safe_execute
     def open_ai_chat(self):
         """Mở dialog chat với Gemini AI"""
-        dialog = AIChatDialog(self)
-        dialog.exec()
+        if not hasattr(self, 'ai_chat_dialog') or not self.ai_chat_dialog:
+            self.ai_chat_dialog = AIChatDialog(self.config_manager, self)
+        
+        # Update schema for context
+        if self.db_schema:
+            self.ai_chat_dialog.update_database_context(self.db_schema)
+        
+        self.ai_chat_dialog.show()
+        self.ai_chat_dialog.raise_()
+        self.ai_chat_dialog.activateWindow()
     
     def show_about(self):
         """Hiển thị thông tin về app"""
         about_text = """
         <h2>SQL Reviewer Pro</h2>
-        <p><b>Version:</b> 2.0</p>
+        <p><b>Version:</b> 3.0</p>
         <p><b>Powered by:</b> Google Gemini AI</p>
         
         <p><b>Features:</b></p>
         <ul>
             <li>✅ Phân tích và review SQL queries chuyên sâu</li>
             <li>✅ Hiển thị schema database chi tiết</li>
-            <li>✅ Lưu/Load connection profiles</li>
-            <li>✅ Export kết quả review</li>
+            <li>✅ Execute SQL queries với auto-complete</li>
+            <li>✅ Bind parameters tool</li>
+            <li>✅ AI Chat Assistant</li>
+            <li>✅ Export results (CSV, Markdown)</li>
             <li>✅ Giao diện đẹp, dễ sử dụng</li>
         </ul>
         
@@ -2584,61 +3145,68 @@ Params: param:[1-1][2-○][3-][4-JPN]
         
         <p><i>© 2025 SQL Reviewer Pro. All rights reserved.</i></p>
         """
-        QMessageBox.about(self, 'About SQL Reviewer Pro', about_text)
+        msg = QMessageBox(self)
+        msg.setWindowTitle('About SQL Reviewer Pro')
+        msg.setTextFormat(Qt.TextFormat.RichText)
+        msg.setText(about_text)
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.exec()
     
     def closeEvent(self, a0: QCloseEvent | None) -> None:
-        """Đóng ứng dụng"""
+        """Handle application close"""
         if self.db_conn:
-            self.db_conn.close()
+            try:
+                self.db_conn.close()
+            except Exception:
+                pass
         if a0:
             a0.accept()
 
 
 def main():
-    """Entry point with proper exception handling for .exe builds"""
+    """Main entry point with improved exception handling for frozen .exe builds"""
+    
+    # Custom exception hook
+    def handle_exception(exc_type, exc_value, exc_traceback):
+        """Global exception handler to prevent silent crashes in .exe"""
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        
+        error_msg = f"❌ Unexpected Error:\n\n{exc_type.__name__}: {str(exc_value)}"
+        try:
+            QMessageBox.critical(None, 'Application Error', error_msg)
+        except Exception:
+            # Fallback if QMessageBox fails
+            print(error_msg)
+    
+    sys.excepthook = handle_exception
+    
+    # Check config
+    config_manager = ConfigManager()
+    api_key = config_manager.get_api_key()
+    
+    if not api_key or api_key == 'YOUR_API_KEY_HERE':
+        logger.warning("API key not configured")
+    
+    # Create and run app
     try:
         app = QApplication(sys.argv)
-        
-        # Set application style
         app.setStyle('Fusion')
         
-        # Configure exception handling for PyQt6
-        def handle_exception(exc_type, exc_value, exc_traceback):
-            if issubclass(exc_type, KeyboardInterrupt):
-                sys.__excepthook__(exc_type, exc_value, exc_traceback)
-                return
-            
-            error_msg = f"❌ Unexpected Error:\n\n{exc_type.__name__}: {str(exc_value)}"
-            try:
-                QMessageBox.critical(None, 'Application Error', error_msg)
-            except Exception:
-                # Fallback if QMessageBox fails
-                print(error_msg)
-        
-        sys.excepthook = handle_exception
-        
-        # Check config
-        config_manager = ConfigManager()
-        api_key = config_manager.get_api_key()
-        
-        if api_key == 'YOUR_API_KEY_HERE':
-            QMessageBox.critical(None, 'Lỗi Cấu hình',
-                '❌ API Key chưa được cấu hình!\n\n' +
-                'Vui lòng:\n' +
-                '1. Mở file config.json\n' +
-                '2. Thay thế YOUR_API_KEY_HERE bằng API key của bạn\n' +
-                '3. Lưu file và khởi động lại ứng dụng\n\n' +
-                'Lấy API key tại: https://makersuite.google.com/app/apikey')
-            sys.exit(1)
-        
-        # Create and show main window
         window = SQLReviewerApp()
         window.show()
         
         sys.exit(app.exec())
-        
     except Exception as e:
-        error_msg = f"❌ Fatal Error during startup:\n\n{type(e).__name__}: {str(e)}"
+        logger.critical("Fatal app error: %s\n%s", e, traceback.format_exc())
+        
+        # Try to show error to user
+        error_msg = (
+            f'❌ Ứng dụng gặp lỗi nghiêm trọng\n\n'
+            f'Lỗi: {type(e).__name__}: {str(e)}\n\n'
+            f'💡 Kiểm tra file app.log để biết chi tiết.'
+        )
         try:
             if 'app' in locals():
                 QMessageBox.critical(None, 'Startup Error', error_msg)
@@ -2653,4 +3221,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
