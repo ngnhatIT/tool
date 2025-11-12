@@ -156,7 +156,7 @@ class ConfigManager:
         """Trả về cấu hình mặc định"""
         return {
             "gemini_api_key": "YOUR_API_KEY_HERE",
-            "gemini_model": "gemini-1.5-flash",
+            "gemini_model": "gemini-2.5-flash",
             "last_connection": {
                 "host": "localhost",
             "port": "3306",
